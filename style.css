@@ -1,0 +1,74 @@
+.jpda-settings {
+    margin-top: 10px;
+}
+
+.jpda-settings .jpda-hint {
+    opacity: 0.85;
+    font-size: 0.9em;
+    margin: 6px 0 10px;
+    line-height: 1.45;
+}
+
+.jpda-settings .jpda-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+}
+
+.jpda-settings .jpda-actions .menu_button {
+    flex: 1 1 140px;
+}
+
+.jpda-settings .jpda-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.jpda-settings .jpda-row > * {
+    min-width: 0;
+}
+
+.jpda-settings .jpda-row select,
+.jpda-settings .jpda-row input,
+.jpda-settings textarea {
+    flex: 1;
+    width: 100%;
+}
+
+.jpda-settings textarea {
+    min-height: 90px;
+    resize: vertical;
+}
+
+.jpda-settings .jpda-subtitle {
+    margin: 10px 0 6px;
+    font-weight: 600;
+    opacity: 0.95;
+}
+
+.jpda-settings .jpda-map-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 8px;
+}
+
+.jpda-settings .jpda-map-item {
+    display: grid;
+    grid-template-columns: 1fr 1fr auto;
+    gap: 6px;
+    align-items: center;
+}
+
+.jpda-settings .jpda-map-item .menu_button {
+    min-width: 42px;
+}
+
+.jpda-settings .jpda-note {
+    opacity: 0.75;
+    font-size: 0.85em;
+    margin-top: 4px;
+}

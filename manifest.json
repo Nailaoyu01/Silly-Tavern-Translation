@@ -1,0 +1,12 @@
+{
+  "display_name": "对白追加翻译",
+  "loading_order": 20,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "OpenAI",
+  "version": "0.3.1",
+  "homePage": "https://github.com/yourname/SillyTavern-Extension-JPDialogueAppend",
+  "minimum_client_version": "1.12.0"
+}
