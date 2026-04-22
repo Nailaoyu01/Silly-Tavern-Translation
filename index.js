@@ -22,6 +22,7 @@ const EXTENSION_KEY = 'jp_dialogue_append';
  *   detect_double_quotes: boolean,
  *   max_segments_per_message: number,
  *   prompt_template: string,
+ *   content_tags: string,
  *   custom_regex: string,
  *   name_mappings: NameMapping[],
  *   batch_mode_enabled: boolean,
@@ -54,6 +55,7 @@ const defaultSettings = {
     detect_double_quotes: true,
     max_segments_per_message: 100,
     prompt_template: defaultPromptTemplate,
+    content_tags: 'content',
     custom_regex: '',
     name_mappings: [],
     batch_mode_enabled: true,
@@ -179,6 +181,10 @@ function buildSettingsHtml() {
 
             <label for="jpda_max_segments_per_message">单条消息最大处理对白数</label>
             <input id="jpda_max_segments_per_message" type="number" min="1" max="300" step="1" />
+
+            <label for="jpda_content_tags">正文 XML 标签（每行或用逗号分隔）</label>
+            <textarea id="jpda_content_tags" class="text_pole" placeholder="例如：content\nmessage\nmain"></textarea>
+            <div class="jpda-note">只会在这些 XML 标签包裹的正文范围内提取对白。支持多个标签名；匹配形如 <code>&lt;content&gt;...&lt;/content&gt;</code> 或带属性的开始标签。</div>
 
             <label for="jpda_custom_regex">自定义对白匹配正则（每行一条）</label>
             <textarea id="jpda_custom_regex" class="text_pole" placeholder="可选。每行一条正则，例如：\n“([\\s\\S]+?)”\n‘([\\s\\S]+?)’\n([^：\\n]{1,20})：([^\\n]+)\n\n当前默认使用第 1 个捕获组作为要翻译的对白内容。"></textarea>
@@ -330,6 +336,7 @@ function loadSettingsToUi() {
     const detectDoubleQuotes = document.getElementById('jpda_detect_double_quotes');
     const maxSegments = document.getElementById('jpda_max_segments_per_message');
     const customRegex = document.getElementById('jpda_custom_regex');
+    const contentTags = document.getElementById('jpda_content_tags');
     const promptTemplate = document.getElementById('jpda_prompt_template');
 
     if (enabled instanceof HTMLInputElement) enabled.checked = !!settings.enabled;
@@ -345,6 +352,7 @@ function loadSettingsToUi() {
     if (detectDoubleQuotes instanceof HTMLInputElement) detectDoubleQuotes.checked = !!settings.detect_double_quotes;
     if (maxSegments instanceof HTMLInputElement) maxSegments.value = String(settings.max_segments_per_message);
     if (customRegex instanceof HTMLTextAreaElement) customRegex.value = String(settings.custom_regex ?? '');
+    if (contentTags instanceof HTMLTextAreaElement) contentTags.value = String(settings.content_tags ?? defaultSettings.content_tags);
     if (promptTemplate instanceof HTMLTextAreaElement) promptTemplate.value = String(settings.prompt_template ?? defaultPromptTemplate);
 
     populateProfileOptions();
@@ -368,8 +376,9 @@ function hashString(input) {
  * @param {RegExp} pattern
  * @param {string} sourceName
  * @param {number} [captureGroup=1]
+ * @param {number} [baseOffset=0]
  */
-function collectPatternMatches(text, pattern, sourceName, captureGroup = 1) {
+function collectPatternMatches(text, pattern, sourceName, captureGroup = 1, baseOffset = 0) {
     const matches = [];
 
     for (const match of text.matchAll(pattern)) {
@@ -382,7 +391,7 @@ function collectPatternMatches(text, pattern, sourceName, captureGroup = 1) {
         }
 
         matches.push({
-            index,
+            index: index + baseOffset,
             full,
             inner,
             source: sourceName,
@@ -406,6 +415,62 @@ function isLikelyMetadataLabel(label) {
     return blocked.includes(normalized);
 }
 
+function escapeRegex(text) {
+    return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function getContentTagNames() {
+    const settings = getSettings();
+    return String(settings.content_tags ?? '')
+        .split(/[\r\n,]+/)
+        .map(x => x.trim())
+        .filter(Boolean);
+}
+
+/**
+ * @param {string} text
+ * @returns {{ tag: string, fullStart: number, fullEnd: number, innerStart: number, innerEnd: number, innerText: string }[]}
+ */
+function getContentRanges(text) {
+    const tagNames = getContentTagNames();
+
+    if (!tagNames.length) {
+        return [{
+            tag: '(entire-message)',
+            fullStart: 0,
+            fullEnd: text.length,
+            innerStart: 0,
+            innerEnd: text.length,
+            innerText: text,
+        }];
+    }
+
+    const ranges = [];
+
+    for (const tagName of tagNames) {
+        const escapedTag = escapeRegex(tagName);
+        const pattern = new RegExp(`<${escapedTag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${escapedTag}>`, 'gi');
+
+        for (const match of text.matchAll(pattern)) {
+            const full = match[0] ?? '';
+            const inner = match[1] ?? '';
+            const fullStart = match.index ?? -1;
+            if (fullStart < 0) continue;
+
+            const openTagEndOffset = full.indexOf('>');
+            if (openTagEndOffset < 0) continue;
+
+            const innerStart = fullStart + openTagEndOffset + 1;
+            const innerEnd = innerStart + inner.length;
+
+            ranges.push({ tag: tagName, fullStart, fullEnd: fullStart + full.length, innerStart, innerEnd, innerText: inner });
+        }
+    }
+
+    ranges.sort((a, b) => a.innerStart - b.innerStart || a.innerEnd - b.innerEnd);
+    return ranges;
+}
+
 function getCustomRegexLines() {
     const settings = getSettings();
     return String(settings.custom_regex ?? '')
@@ -416,6 +481,7 @@ function getCustomRegexLines() {
 
 function getQuoteMatches(text) {
     const settings = getSettings();
+    const contentRanges = getContentRanges(text);
     const matches = [];
     const patterns = [
         { regex: /「([\s\S]+?)」/g, source: 'corner-brackets', captureGroup: 1 },
@@ -431,16 +497,20 @@ function getQuoteMatches(text) {
         patterns.push({ regex: /"([\s\S]+?)"/g, source: 'double-quotes', captureGroup: 1 });
     }
 
-    for (const { regex, source, captureGroup } of patterns) {
-        matches.push(...collectPatternMatches(text, regex, source, captureGroup));
+    for (const range of contentRanges) {
+        for (const { regex, source, captureGroup } of patterns) {
+            matches.push(...collectPatternMatches(range.innerText, regex, source, captureGroup, range.innerStart));
+        }
     }
 
-    for (const customRegexLine of getCustomRegexLines()) {
-        try {
-            const customPattern = new RegExp(customRegexLine, 'g');
-            matches.push(...collectPatternMatches(text, customPattern, `custom-regex:${customRegexLine}`, 1));
-        } catch (error) {
-            console.warn('[JPDA] 自定义正则无效', customRegexLine, error);
+    for (const range of contentRanges) {
+        for (const customRegexLine of getCustomRegexLines()) {
+            try {
+                const customPattern = new RegExp(customRegexLine, 'g');
+                matches.push(...collectPatternMatches(range.innerText, customPattern, `custom-regex:${customRegexLine}`, 1, range.innerStart));
+            } catch (error) {
+                console.warn('[JPDA] 自定义正则无效', customRegexLine, error);
+            }
         }
     }
 
@@ -472,12 +542,15 @@ function getQuoteMatches(text) {
     const finalMatches = deduped.slice(0, settings.max_segments_per_message);
 
     console.log('[JPDA] 对白抓取统计', {
+        contentTags: getContentTagNames(),
+        contentRanges: contentRanges.map(x => ({ tag: x.tag, innerStart: x.innerStart, innerEnd: x.innerEnd, preview: x.innerText.slice(0, 100) })),
         totalRawMatches: matches.length,
         dedupedMatches: deduped.length,
         finalMatches: finalMatches.length,
         maxSegmentsPerMessage: settings.max_segments_per_message,
         samples: finalMatches.slice(0, 10).map(x => ({
             source: x.source,
+            index: x.index,
             full: x.full,
             inner: x.inner,
         })),
@@ -743,6 +816,7 @@ async function processMessage(messageId, { force = false } = {}) {
         text: sourceText,
         regex: settings.custom_regex,
         detectDoubleQuotes: settings.detect_double_quotes,
+        contentTags: settings.content_tags,
         mappings: getNormalizedMappings(),
         prompt: settings.prompt_template,
         maxTokens: settings.max_tokens,
@@ -912,6 +986,12 @@ function bindSettingsEvents() {
     document.getElementById('jpda_custom_regex')?.addEventListener('input', (event) => {
         const settings = getSettings();
         settings.custom_regex = String(event.target.value ?? '');
+        saveSettings();
+    });
+
+    document.getElementById('jpda_content_tags')?.addEventListener('input', (event) => {
+        const settings = getSettings();
+        settings.content_tags = String(event.target.value ?? '');
         saveSettings();
     });
 
