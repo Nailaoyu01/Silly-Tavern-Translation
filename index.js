@@ -23,6 +23,7 @@ const EXTENSION_KEY = 'jp_dialogue_append';
  *   max_segments_per_message: number,
  *   prompt_template: string,
  *   content_tags: string,
+ *   render_mode: string,
  *   custom_regex: string,
  *   name_mappings: NameMapping[],
  *   batch_mode_enabled: boolean,
@@ -56,6 +57,7 @@ const defaultSettings = {
     max_segments_per_message: 100,
     prompt_template: defaultPromptTemplate,
     content_tags: 'content',
+    render_mode: 'display_text',
     custom_regex: '',
     name_mappings: [],
     batch_mode_enabled: true,
@@ -185,6 +187,13 @@ function buildSettingsHtml() {
             <label for="jpda_content_tags">正文 XML 标签（每行或用逗号分隔）</label>
             <textarea id="jpda_content_tags" class="text_pole" placeholder="例如：content\nmessage\nmain"></textarea>
             <div class="jpda-note">只会在这些 XML 标签包裹的正文范围内提取对白。支持多个标签名；匹配形如 <code>&lt;content&gt;...&lt;/content&gt;</code> 或带属性的开始标签。</div>
+
+            <label for="jpda_render_mode">渲染模式</label>
+            <select id="jpda_render_mode">
+                <option value="display_text">覆盖显示（默认）</option>
+                <option value="dom_compatible">状态栏兼容模式</option>
+            </select>
+            <div class="jpda-note">“覆盖显示”会改写 <code>display_text</code>，兼容性较低；“状态栏兼容模式”会尽量保留原消息渲染结果，仅修改正文标签内的内容。</div>
 
             <label for="jpda_custom_regex">自定义对白匹配正则（每行一条）</label>
             <textarea id="jpda_custom_regex" class="text_pole" placeholder="可选。每行一条正则，例如：\n“([\\s\\S]+?)”\n‘([\\s\\S]+?)’\n([^：\\n]{1,20})：([^\\n]+)\n\n当前默认使用第 1 个捕获组作为要翻译的对白内容。"></textarea>
@@ -338,6 +347,7 @@ function loadSettingsToUi() {
     const customRegex = document.getElementById('jpda_custom_regex');
     const contentTags = document.getElementById('jpda_content_tags');
     const promptTemplate = document.getElementById('jpda_prompt_template');
+    const renderMode = document.getElementById('jpda_render_mode');
 
     if (enabled instanceof HTMLInputElement) enabled.checked = !!settings.enabled;
     if (autoMode instanceof HTMLSelectElement) autoMode.value = settings.auto_mode;
@@ -353,6 +363,7 @@ function loadSettingsToUi() {
     if (maxSegments instanceof HTMLInputElement) maxSegments.value = String(settings.max_segments_per_message);
     if (customRegex instanceof HTMLTextAreaElement) customRegex.value = String(settings.custom_regex ?? '');
     if (contentTags instanceof HTMLTextAreaElement) contentTags.value = String(settings.content_tags ?? defaultSettings.content_tags);
+    if (renderMode instanceof HTMLSelectElement) renderMode.value = String(settings.render_mode ?? defaultSettings.render_mode);
     if (promptTemplate instanceof HTMLTextAreaElement) promptTemplate.value = String(settings.prompt_template ?? defaultPromptTemplate);
 
     populateProfileOptions();
@@ -559,14 +570,14 @@ function getQuoteMatches(text) {
     return finalMatches;
 }
 
-function buildRenderedText(sourceText, matches, translations) {
+function buildRenderedInnerText(sourceText, matches, translations, startOffset = 0) {
     let cursor = 0;
     let output = '';
 
     for (let i = 0; i < matches.length; i++) {
         const match = matches[i];
         const translation = String(translations[i] ?? '').trim();
-        const start = match.index;
+        const start = match.index - startOffset;
         const end = start + match.full.length;
 
         output += sourceText.slice(cursor, start);
@@ -576,6 +587,105 @@ function buildRenderedText(sourceText, matches, translations) {
 
     output += sourceText.slice(cursor);
     return output;
+}
+
+function buildRenderedText(sourceText, matches, translations) {
+    const contentRanges = getContentRanges(sourceText);
+
+    if (!contentRanges.length) {
+        return sourceText;
+    }
+
+    let cursor = 0;
+    let output = '';
+    let translationIndex = 0;
+
+    for (const range of contentRanges) {
+        output += sourceText.slice(cursor, range.innerStart);
+
+        const rangeMatches = [];
+        const rangeTranslations = [];
+        while (translationIndex < matches.length) {
+            const match = matches[translationIndex];
+            const matchEnd = match.index + match.full.length;
+
+            if (match.index >= range.innerStart && matchEnd <= range.innerEnd) {
+                rangeMatches.push(match);
+                rangeTranslations.push(translations[translationIndex]);
+                translationIndex++;
+                continue;
+            }
+
+            break;
+        }
+
+        output += buildRenderedInnerText(range.innerText, rangeMatches, rangeTranslations, range.innerStart);
+        cursor = range.innerEnd;
+    }
+
+    output += sourceText.slice(cursor);
+    return output;
+}
+
+function getMessageTextElement(messageId) {
+    return document.querySelector(`#chat .mes[mesid="${messageId}"] .mes_text`);
+}
+
+function applyCompatibleRender(messageId, sourceText, matches, translations) {
+    const mesText = getMessageTextElement(messageId);
+    if (!(mesText instanceof HTMLElement)) {
+        return false;
+    }
+
+    const tagNames = getContentTagNames();
+    if (!tagNames.length) {
+        return false;
+    }
+
+    const contentRanges = getContentRanges(sourceText);
+    if (!contentRanges.length) {
+        return false;
+    }
+
+    const selector = tagNames.join(',');
+    const contentElements = Array.from(mesText.querySelectorAll(selector));
+    if (!contentElements.length) {
+        console.warn('[JPDA] 兼容模式未在已渲染消息中找到正文标签元素', { messageId, selector });
+        return false;
+    }
+
+    let translationIndex = 0;
+    const pairCount = Math.min(contentRanges.length, contentElements.length);
+
+    for (let i = 0; i < pairCount; i++) {
+        const range = contentRanges[i];
+        const element = contentElements[i];
+        const localMatches = [];
+        const localTranslations = [];
+
+        while (translationIndex < matches.length) {
+            const match = matches[translationIndex];
+            const start = match.index;
+            const end = start + match.full.length;
+
+            if (start >= range.innerStart && end <= range.innerEnd) {
+                localMatches.push({
+                    ...match,
+                    index: start - range.innerStart,
+                });
+                localTranslations.push(translations[translationIndex]);
+                translationIndex++;
+                continue;
+            }
+
+            break;
+        }
+
+        const transformed = buildRenderedText(range.innerText, localMatches, localTranslations);
+        element.textContent = transformed;
+    }
+
+    return true;
 }
 
 function extractJsonPayload(raw) {
@@ -818,6 +928,7 @@ async function processMessage(messageId, { force = false } = {}) {
         detectDoubleQuotes: settings.detect_double_quotes,
         contentTags: settings.content_tags,
         mappings: getNormalizedMappings(),
+        renderMode: settings.render_mode,
         prompt: settings.prompt_template,
         maxTokens: settings.max_tokens,
         targetLanguage: settings.target_language,
@@ -828,9 +939,19 @@ async function processMessage(messageId, { force = false } = {}) {
 
     const cache = message.extra?.jp_dialogue_append;
     if (!force && cache?.source_hash === sourceHash && cache?.rendered_text) {
-        if (message.extra?.display_text !== cache.rendered_text) {
-            message.extra.display_text = cache.rendered_text;
-            updateMessageBlock(Number(messageId), message);
+        if (settings.render_mode === 'dom_compatible') {
+            const applied = applyCompatibleRender(Number(messageId), sourceText, matches, cache.translations ?? []);
+            if (!applied) {
+                if (message.extra?.display_text !== cache.rendered_text) {
+                    message.extra.display_text = cache.rendered_text;
+                    updateMessageBlock(Number(messageId), message);
+                }
+            }
+        } else {
+            if (message.extra?.display_text !== cache.rendered_text) {
+                message.extra.display_text = cache.rendered_text;
+                updateMessageBlock(Number(messageId), message);
+            }
         }
         return;
     }
@@ -857,8 +978,19 @@ async function processMessage(messageId, { force = false } = {}) {
             updated_at: Date.now(),
         };
 
-        message.extra.display_text = renderedText;
-        updateMessageBlock(Number(messageId), message);
+        if (settings.render_mode === 'dom_compatible') {
+            delete message.extra.display_text;
+            updateMessageBlock(Number(messageId), message);
+            const applied = applyCompatibleRender(Number(messageId), sourceText, matches, translations);
+
+            if (!applied) {
+                message.extra.display_text = renderedText;
+                updateMessageBlock(Number(messageId), message);
+            }
+        } else {
+            message.extra.display_text = renderedText;
+            updateMessageBlock(Number(messageId), message);
+        }
     } catch (error) {
         console.error('[JPDA] 处理消息失败', messageId, error);
         toastr.error(String(error?.message ?? error), '对白追加翻译');
@@ -992,6 +1124,12 @@ function bindSettingsEvents() {
     document.getElementById('jpda_content_tags')?.addEventListener('input', (event) => {
         const settings = getSettings();
         settings.content_tags = String(event.target.value ?? '');
+        saveSettings();
+    });
+
+    document.getElementById('jpda_render_mode')?.addEventListener('change', (event) => {
+        const settings = getSettings();
+        settings.render_mode = String(event.target.value ?? '') || defaultSettings.render_mode;
         saveSettings();
     });
 
